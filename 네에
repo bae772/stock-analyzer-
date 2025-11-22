@@ -1,0 +1,107 @@
+# app.py
+import streamlit as st
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+st.set_page_config(page_title="개인 주식 분석기", layout="wide")
+
+def compute_indicators(df):
+    df = df.copy()
+    price = df["Adj Close"]
+    df["SMA20"] = price.rolling(window=20).mean()
+    df["SMA50"] = price.rolling(window=50).mean()
+    df["EMA12"] = price.ewm(span=12, adjust=False).mean()
+    df["EMA26"] = price.ewm(span=26, adjust=False).mean()
+    df["MACD"] = df["EMA12"] - df["EMA26"]
+    df["MACD_signal"] = df["MACD"].ewm(span=9, adjust=False).mean()
+    delta = price.diff()
+    up = delta.clip(lower=0)
+    down = (-delta).clip(lower=0)
+    ma_up = up.ewm(com=13, adjust=False).mean()
+    ma_down = down.ewm(com=13, adjust=False).mean()
+    rs = ma_up / (ma_down + 1e-9)
+    df["RSI"] = 100 - (100 / (1 + rs))
+    return df
+
+def generate_signals(df):
+    df = df.copy()
+    df["signal"] = 0
+    diff = df["SMA20"] - df["SMA50"]
+    prev = diff.shift(1)
+    buy = (diff > 0) & (prev <= 0)
+    sell = (diff < 0) & (prev >= 0)
+    df.loc[buy, "signal"] = 1
+    df.loc[sell, "signal"] = -1
+    return df
+
+def backtest(df, initial_cash=100000):
+    df = df.copy()
+    cash = initial_cash
+    shares = 0
+    trades = []
+    for i, row in df.iterrows():
+        sig = row["signal"]
+        price = row["Adj Close"]
+        if sig == 1 and cash > price:
+            new_shares = int(cash // price)
+            cost = new_shares * price
+            cash -= cost
+            shares += new_shares
+            trades.append((i, "BUY", price, new_shares, cash))
+        elif sig == -1 and shares > 0:
+            proceeds = shares * price
+            cash += proceeds
+            trades.append((i, "SELL", price, shares, cash))
+            shares = 0
+    final_value = cash + shares * df["Adj Close"].iloc[-1]
+    total_return = (final_value / initial_cash - 1) * 100
+    return trades, total_return, final_value
+
+st.title("개인 주식 분석기 (A 버전 — 기본형)")
+st.markdown("간단: 티커 입력 → 지표 계산 → 신호 표시 → 백테스트 결과")
+
+symbol = st.text_input("종목 티커 (예: AAPL, 005930.KS)", value="AAPL")
+period_option = st.selectbox("기간", ["6mo", "1y", "2y", "5y", "10y"], index=1)
+
+if st.button("분석하기"):
+    with st.spinner("데이터 불러오는 중..."):
+        df = yf.download(symbol, period=period_option, progress=False)
+    if df.empty:
+        st.error("데이터를 불러올 수 없습니다. 티커를 확인하세요.")
+        st.stop()
+    df = compute_indicators(df)
+    df = generate_signals(df)
+    trades, total_return, final_value = backtest(df)
+
+    st.subheader("백테스트 결과")
+    st.write(f"총 수익률: **{total_return:.2f}%**")
+    st.write(f"최종 평가액: **{final_value:,.0f} USD**")
+
+    fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
+    axes[0].plot(df.index, df["Adj Close"], label="Price")
+    axes[0].plot(df.index, df["SMA20"], label="SMA20")
+    axes[0].plot(df.index, df["SMA50"], label="SMA50")
+    axes[0].legend()
+    for t in trades:
+        date, typ, price, qty, cash = t
+        if typ == "BUY":
+            axes[0].scatter(date, price, marker="^", s=80)
+        else:
+            axes[0].scatter(date, price, marker="v", s=80)
+    axes[1].plot(df.index, df["MACD"], label="MACD")
+    axes[1].plot(df.index, df["MACD_signal"], label="Signal")
+    axes[1].legend()
+    axes[2].plot(df.index, df["RSI"], label="RSI")
+    axes[2].axhline(70, linestyle="--")
+    axes[2].axhline(30, linestyle="--")
+    axes[2].legend()
+    st.pyplot(fig)
+
+    st.subheader("매매 내역")
+    if len(trades) == 0:
+        st.write("매매 없음")
+    else:
+        trade_df = pd.DataFrame(trades, columns=["Date", "Type", "Price", "Shares", "Cash"])
+        st.dataframe(trade_df)
