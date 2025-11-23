@@ -1,0 +1,170 @@
+# streamlit_app.py
+import streamlit as st
+import yfinance as yf
+import pandas as pd
+import numpy as np
+from datetime import datetime
+import plotly.graph_objects as go
+
+st.set_page_config(page_title="베짱이 계산기", layout="wide")
+st.title("베짱이 계산기")
+
+# ── 자동 학습 함수 ──
+def auto_learn(history_csv="prediction_history.csv"):
+    import os
+    if not os.path.exists(history_csv):
+        return {}
+    df = pd.read_csv(history_csv)
+    df = df.dropna(subset=["예측결과", "AI_SCORE"])
+    if df.empty:
+        return {}
+    results = {}
+    for signal_type in ["BUY", "SELL", "HOLD"]:
+        sig_df = df[df["Signal"]==signal_type]
+        if len(sig_df)==0: continue
+        accuracy = len(sig_df[sig_df["예측결과"]=="맞음"]) / len(sig_df)
+        results[signal_type] = accuracy
+    score_adjust = {}
+    score_adjust["BUY"] = results.get("BUY", 0.5)
+    score_adjust["SELL"] = results.get("SELL", 0.5)
+    score_adjust["HOLD"] = results.get("HOLD", 0.5)
+    return score_adjust
+
+score_weights = auto_learn("prediction_history.csv")
+
+# ── 사용자 입력 ──
+tickers_input = st.text_input("티커 입력 (쉼표로 구분, 예: BMR,TSLA,MARA)", value="BMR")
+avg_price_input = st.text_input("보유 평단가 입력 (쉼표로 구분, 없으면 0)", value="0")
+
+tickers = [x.strip().upper() for x in tickers_input.split(",") if x.strip()]
+avg_prices = [float(x) for x in avg_price_input.split(",")] if avg_price_input else [0]*len(tickers)
+if len(avg_prices)<len(tickers):
+    avg_prices += [0]*(len(tickers)-len(avg_prices))
+
+# ── 각 종목 처리 ──
+for idx, ticker in enumerate(tickers):
+    avg_price = avg_prices[idx] if idx<len(avg_prices) else 0
+    try:
+        # 실시간 시세
+        data_real = yf.download(ticker, period="7d", interval="5m", progress=False, auto_adjust=True)
+        # 1일~3달 시세
+        data_daily = yf.download(ticker, period="3mo", interval="1d", progress=False, auto_adjust=True)
+
+        if data_daily.empty or len(data_daily)<5:
+            st.warning(f"{ticker}: 데이터 부족")
+            continue
+
+        close_daily = data_daily['Close'].dropna()
+        last_close_daily = float(close_daily.iloc[-1])
+        last_date = close_daily.index[-1].strftime('%Y-%m-%d')
+
+        # ── 등락률 계산
+        periods = {"1일":1, "1주":5, "3달":66}
+        pct_changes = {}
+        for name, days in periods.items():
+            if len(close_daily) > days:
+                past = float(close_daily.iloc[-days])
+                pct_changes[name] = round((last_close_daily - past)/past*100, 2)
+            else:
+                pct_changes[name] = None
+
+        # ── RSI
+        delta = close_daily.diff()
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        avg_gain = gain.rolling(14).mean()
+        avg_loss = loss.rolling(14).mean()
+        rs = avg_gain / avg_loss
+        rsi = 100 - 100/(1+rs)
+        last_rsi = float(rsi.iloc[-1])
+
+        # ── 이동평균
+        ma20 = close_daily.rolling(20).mean()
+        ma50 = close_daily.rolling(50).mean()
+        last_ma20 = float(ma20.iloc[-1])
+        last_ma50 = float(ma50.iloc[-1])
+
+        # ── MACD
+        ema12 = close_daily.ewm(span=12, adjust=False).mean()
+        ema26 = close_daily.ewm(span=26, adjust=False).mean()
+        macd = ema12 - ema26
+        signal = macd.ewm(span=9, adjust=False).mean()
+        macd_diff = macd - signal
+        last_macd_diff = float(macd_diff.iloc[-1])
+
+        # ── 볼린저밴드
+        std20 = close_daily.rolling(20).std()
+        upper_band = ma20 + 2*std20
+        lower_band = ma20 - 2*std20
+        last_upper = float(upper_band.iloc[-1])
+        last_lower = float(lower_band.iloc[-1])
+
+        # ── AI SCORE
+        change_pct = pct_changes.get("1일",0)
+        base_score = 50.0
+        base_score += max(0,30-last_rsi)*1.4*score_weights.get("BUY",1.0)
+        base_score += change_pct*2.0*score_weights.get("BUY",1.0)
+        base_score += 15 if last_close_daily>last_ma20 else -10
+        base_score += 10 if last_close_daily>last_ma50 else -8
+        base_score += 10 if last_macd_diff>0 else -10
+        base_score += 5 if last_close_daily<last_lower else -5
+        score = int(np.clip(base_score,0,100))
+
+        if score>=80:
+            grade="A (강력매수)"; reason="RSI 저평가 + 상승추세 + MACD 골든크로스 등 긍정적 신호"
+        elif score>=70:
+            grade="A (매수)"; reason="추세 상승 + 일부 기술적 지표 긍정적"
+        elif score>=60:
+            grade="B (관망)"; reason="단기 변동성 존재, 신중 관망 필요"
+        elif score>=40:
+            grade="C (주의)"; reason="과열/하락 위험, 일부 매수 가능성만"
+        else:
+            grade="D (매도)"; reason="과열/하락 신호 다수, 매수 지양"
+
+        if avg_price>0:
+            profit_pct = round((last_close_daily-avg_price)/avg_price*100,2)
+            profit_text = f"{profit_pct}% ({'수익' if profit_pct>=0 else '손실'})"
+        else:
+            profit_text="평단가 입력 없음"
+
+        # ── Signal 판단
+        if last_rsi<30 and last_macd_diff>0 and last_close_daily<last_lower:
+            Buy_Signal=True; Sell_Signal=False; signal_reason="강력 매수"
+        elif last_rsi<40 and last_macd_diff>0:
+            Buy_Signal=True; Sell_Signal=False; signal_reason="매수"
+        elif last_rsi>70 or last_close_daily>last_upper:
+            Buy_Signal=False; Sell_Signal=True; signal_reason="매도"
+        else:
+            Buy_Signal=Sell_Signal=False; signal_reason="관망"
+
+        short_strategy = "단기: " + ("매수 추천" if Buy_Signal else "매도 추천" if Sell_Signal else "관망")
+        long_strategy = "장기: 상승추세" if last_close_daily>last_ma20 else "장기: 하락추세 또는 관망"
+
+        # ── UI 출력
+        with st.expander(f"{ticker} 정보 보기", expanded=True):
+            st.markdown(f"**종가 (마지막 일봉):** {last_close_daily:.2f} USD ({last_date})")
+            st.markdown(f"**AI Score:** {score} [{grade}]")
+            st.markdown(f"**매수/매도 근거:** {reason}")
+            st.markdown(f"**평단가 대비 수익률:** {profit_text}")
+            st.markdown(f"**Signal:** {'BUY' if Buy_Signal else 'SELL' if Sell_Signal else 'HOLD'} ({signal_reason})")
+            st.markdown(f"**단기 전략:** {short_strategy}")
+            st.markdown(f"**장기 전략:** {long_strategy}")
+
+            st.markdown("**기간별 등락률:**")
+            for p_name in ["1일","1주","3달"]:
+                pct = pct_changes.get(p_name)
+                if pct is not None:
+                    st.markdown(f"- {p_name} 전 대비: {pct}% {'상승' if pct>0 else '하락'}")
+
+            # ── 실시간 시세 차트
+            chart_close = data_real['Close'].dropna().reset_index(drop=True)
+            x_axis = list(range(len(chart_close)))
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=x_axis, y=chart_close, mode='lines', name='실시간 Close'))
+            fig.update_layout(title=f"{ticker} 실시간 차트", xaxis_title="시간", yaxis_title="가격", template='plotly_dark')
+            st.plotly_chart(fig, use_container_width=True)
+
+        st.caption(f"업데이트: {datetime.now().strftime('%Y-%m-%d %H:%M')} │ 데이터: Yahoo Finance")
+
+    except Exception as e:
+        st.error(f"{ticker} 오류 발생: {e}")
