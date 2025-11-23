@@ -1,7 +1,0 @@
-yfinance
-pandas
-numpy
-scikit-learn
-joblib
-plotly
-kaleido
